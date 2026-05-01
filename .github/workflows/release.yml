@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,6 +20,23 @@ jobs:
         with:
           go-version: "1.26"
 
+      - name: Import Apple certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > $RUNNER_TEMP/certificate.p12
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $RUNNER_TEMP/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
@@ -27,3 +44,53 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Sign and notarize macOS binaries
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          for ARCH in amd64 arm64; do
+            ARCHIVE="dist/kuality_${VERSION}_darwin_${ARCH}.tar.gz"
+            WORKDIR=$(mktemp -d)
+
+            tar xzf "$ARCHIVE" -C "$WORKDIR"
+
+            codesign --force --options runtime --sign "Developer ID Application: $APPLE_TEAM_ID" "$WORKDIR/kuality"
+
+            ZIP="$WORKDIR/kuality-${ARCH}.zip"
+            ditto -c -k "$WORKDIR/kuality" "$ZIP"
+
+            xcrun notarytool submit "$ZIP" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_ID_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+
+            xcrun stapler staple "$WORKDIR/kuality" || true
+
+            tar czf "$ARCHIVE" -C "$WORKDIR" kuality
+            rm -rf "$WORKDIR"
+          done
+
+      - name: Update release checksums and re-upload macOS archives
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          TAG=${GITHUB_REF#refs/tags/}
+
+          cd dist
+          shasum -a 256 kuality_${VERSION}_darwin_amd64.tar.gz kuality_${VERSION}_darwin_arm64.tar.gz > darwin_checksums.txt
+
+          for ARCH in amd64 arm64; do
+            gh release upload "$TAG" "kuality_${VERSION}_darwin_${ARCH}.tar.gz" --clobber
+          done
+          gh release upload "$TAG" darwin_checksums.txt --clobber
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true

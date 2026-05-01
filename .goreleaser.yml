@@ -48,7 +48,7 @@ homebrew_casks:
     binaries:
       - kuality
     homepage: "https://kuality.io"
-    description: "Scan any website for accessibility, performance, SEO, cross-browser, and 30+ QA dimensions"
+    description: "Test any website for accessibility, performance, SEO, cross-browser, and 30+ QA dimensions"
     directory: Casks
     repository:
       owner: kuality-io
